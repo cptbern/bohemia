@@ -1,0 +1,219 @@
+---
+title: "Fieldworker deployment Mozambique"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, echo=F, warning=F, results=F}
+library(tidyverse)
+library(magrittr)
+library(ggmap)
+# library(igraph)
+library(geosphere)
+library(data.table)
+library(DT)
+library(TSP)
+
+SOURCE_DIR <- "../SourceData"
+DERIVED_DIR <- "../DerivedData"
+
+SOURCE_HOUSEHOLDS <- paste( SOURCE_DIR, "2021-09-23 - Household Data.csv", sep="/")
+DERIVED_FULLY_CONNECTED <- paste( DERIVED_DIR, "2021-09-23 - FullyConnected.csv", sep="/")
+DERIVED_HOUSEHOLDS_CORE <- paste( DERIVED_DIR, "2021-09-26 - Households_core.gdf", sep="/")
+```
+
+Calculate the fieldworkers required for questionnaires in all households in Mozambique. This is done by
+
+* finding a route that passes all households in a cluster exactly once,
+* assuming an average travel speed, and
+* estimating visit duration from size of household (using [a linear model](https://github.com/databrew/bohemia/tree/master/scripts/fullcensus/report)).
+
+Clusters are then classified by criticality, i.e. which clusters require more work than a field worker (work unit) can do between visits.
+
+NOTE: this Rmd does not rely on igraph functionality
+
+# Setup
+```{r echo=F}
+df.raw.households <- read.csv( SOURCE_HOUSEHOLDS, stringsAsFactors = F)
+
+head(df.raw.households)
+```
+Quick look at the data
+```{r}
+summary( df.raw.households )
+```
+
+## Visualize
+
+```{r}
+moz <- c(left = 35.29, bottom = -18.2, right = 36.57, top = -17.52)
+
+map.moz <- get_map(location=moz, source="stamen", maptype="watercolor", crop=FALSE)
+
+ggmap( map.moz ) +
+  geom_point( data=df.raw.households %>% filter(core_or_buffer=="buffer"), aes(lng, lat, color=core_or_buffer), size=0.8 ) +
+  geom_point( data=df.raw.households %>% filter(core_or_buffer=="core"), aes(lng, lat, color=core_or_buffer), size=0.1, alpha=0.3 ) +
+  scale_color_manual( values=c("core"="orange", "buffer"="darkred")) +
+  labs( title="Households Mozambique",
+        x="Longitude",
+        y="Latitude",
+        color="Role in cluster")
+```
+# Estimate time effort per cluster
+## Work load per household
+We assume 20 mins base time for each visit and an additional 15" for each member of the household according to Joe's linear model. Values are in [h].
+
+```{r}
+df.workload <- df.raw.households %>%
+                        mutate( visit_duration = 20/60 + n_people*15/60 ) %>% # 20" base, 15" per person ...
+                        select( hh_id, visit_duration, lng, lat, cluster )
+
+df.workload %<>% 
+  group_by( cluster ) %>% 
+  summarise( cluster_visit_time = sum(visit_duration),
+             lng = mean(lng),
+             lat = mean(lat),
+             n = n()) %>% 
+  ungroup()
+```
+
+## Tour all households by cluster
+Here we look for a route visiting all households in a cluster exactly once. Given an average speed we can take a guess at how long this may take.
+
+The following helper function creates a symmetric adjacency matrix that can be processed by the TSP solver. The solver returns a route in [m].
+
+```{r}
+get_tsp_distance <- function( cluster_no, verbose=0 ) {
+  if( verbose==1 )
+    sprintf( "Cluster #%d", cluster_no )
+  df <- df.raw.households %>% 
+    filter( cluster == cluster_no )
+
+  nodes <- unique(df$hh_id)
+  order <- length(nodes)
+  edges <- data.frame( matrix(0L, nrow=order, ncol=order))
+  colnames(edges) <- nodes
+  rownames(edges) <- nodes
+  edges$start <- nodes
+  
+  trips <- edges %>% 
+    pivot_longer(!start, names_to = "dest", values_to = "dist")
+  
+  # add geospatial data for both nodes
+  trips <- merge( trips, df.raw.households %>% select(hh_id, lat, lng), by.x="start", by.y="hh_id", all.x=T)
+  trips <- merge( trips,  df.raw.households %>% select(hh_id, lat, lng), by.x="dest", by.y="hh_id", all.x=T)
+  
+  # calculate distances
+  trips$dist <- distHaversine(trips[,4:5], trips[,6:7])
+  
+  edges <-
+    trips %>% 
+    select( start, dest, dist ) %>% 
+    pivot_wider( names_from = dest, values_from = dist) %>% 
+    arrange(start) %>% 
+    select(sort(current_vars())) %>% # sort by col names
+    select(-start)
+  
+  colnames(edges) <-c() # if we don't do this we get a 'not symmetric matrix' error ...
+  
+  distances <- data.matrix(edges)
+
+  tsp <- TSP(distances)
+  tour <- solve_TSP(tsp)
+  
+  return(attr(tour, "tour_length"))
+}
+```
+
+For cluster #1:
+```{r}
+print( get_tsp_distance(cluster_no = 1) )
+```
+
+Do this for every cluster. Assume an average speed of 3 km/h and 30" to pack up and leave. This could be adapted to cluster location if desired.
+
+```{r}
+travel_speed <- 3 # kph
+df.workload %<>%
+  group_by(cluster) %>% 
+  mutate( tour = get_tsp_distance(cluster)) %>% 
+  mutate( cluster_travel_time = n*0.5 + (tour/1000)/travel_speed)
+
+df.workload
+```
+# Results 
+Everything in place to summarise. A field worker's maximum work capacity is put at 24 workdays @7h (8h with 1h break).
+
+## Distribution of work load
+```{r}
+field_worker_capacity <- (8-1)*24
+
+df.workload %<>% 
+  mutate( total_time = cluster_visit_time + cluster_travel_time )
+
+ggplot( df.workload, aes(total_time)) +
+  geom_histogram(fill="lightblue") +
+  geom_vline( xintercept = field_worker_capacity, linetype="dashed") +
+  annotate( "text", x=50+field_worker_capacity, y=50, label="24 d") +
+  labs( title = "Time required per cluster",
+        x = "Total time [h]",
+        y = "Number of clusters") +
+  theme_minimal()
+```
+
+## Total estimates
+Total workload for site in [h]
+
+```{r}
+site_work_load <- sum(df.workload$total_time)
+site_work_load
+```
+
+Given field worker capacity, calculate number of field workers required.
+
+Note: this is an upper bound because here every single household participates. In reality, this will be higher because of backtracking to re-visit households where nobody was in. Additionally, while routing would need to be optimized, the real route taken by field workers will also be determined by 
+
+* personal preference (familiarity with terrain)
+* environmental factors like rainfall requiring re-routing
+
+```{r}
+site_work_load / field_worker_capacity
+```
+
+## Visualization
+Criticality categories:
+- >95% of total workload = red
+- 80-95% of total workload = yellow
+- <80% of total workload = green
+
+```{r}
+max_time <- max(df.workload$total_time)
+df.workload %<>%
+  mutate( node_weight = total_time / max_time,
+          criticality = case_when(
+            total_time > field_worker_capacity*.95 ~ "red",
+            total_time < field_worker_capacity*.8 ~ "green",
+            TRUE ~ "yellow"
+          ))
+
+ggmap( map.moz ) +
+  geom_point( data=df.workload, aes(lng, lat, size=node_weight, color=criticality), alpha=0.5 ) +
+  scale_color_manual(values=c("red" = "darkred", "yellow"="sienna2", "green" = "darkgreen")) +
+  labs( title="Workload by Cluster (Mozambique)",
+        subtitle="Relative working hours estimate",
+        caption="24 8h workdays, travel at 3kph, visits 20 min +15 min per person",
+        x="Longitude",
+        y="Latitude",
+        color="Criticality") +
+  guides(size=F)
+```
+
+## Interactive table
+```{r}
+datatable(df.workload %>% select(-lng, -lat, -node_weight))
+```
+
